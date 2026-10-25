@@ -6,6 +6,7 @@ import math
 import os
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -40,13 +41,14 @@ class NewsDataset(Dataset):
                 "labels": torch.tensor(self.labels[index])}
 
 
-def main(fast=False):
+def main(fast=False, evaluate_checkpoint=None):
     if not (PROCESSED_DIR / "news.csv").is_file():
         prepare_dataset()
     frame = pd.read_csv(PROCESSED_DIR / "news.csv")
     train = frame[frame.split == "train"]
     validation = frame[frame.split == "validation"]
     test = frame[frame.split == "test"]
+    checkpoint = Path(evaluate_checkpoint).resolve() if evaluate_checkpoint else None
     max_length = 96 if fast else int(BERT["max_sequence_length"])
     epochs = 1 if fast else int(BERT["epochs"])
     train_batch_size = 16 if fast else int(BERT["batch_size"])
@@ -60,8 +62,17 @@ def main(fast=False):
             validation, train_size=min(256, len(validation)), random_state=SEED,
             stratify=validation.label_id,
         )
-    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
-    model = AutoModelForSequenceClassification.from_pretrained(BASE_MODEL, num_labels=2)
+        test, _ = train_test_split(
+            test, train_size=min(1024, len(test)), random_state=SEED,
+            stratify=test.label_id,
+        )
+    model_source = checkpoint or BASE_MODEL
+    tokenizer = AutoTokenizer.from_pretrained(model_source, local_files_only=checkpoint is not None)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_source,
+        local_files_only=checkpoint is not None,
+        **({} if checkpoint else {"num_labels": 2}),
+    )
     output_dir = ROOT / "models" / "bert"
     output_dir.mkdir(parents=True, exist_ok=True)
     eval_strategy_parameter = (
@@ -69,13 +80,21 @@ def main(fast=False):
         if "eval_strategy" in inspect.signature(TrainingArguments).parameters
         else "evaluation_strategy"
     )
+    training_state_path = checkpoint / "trainer_state.json" if checkpoint else None
+    saved_state = (
+        json.loads(training_state_path.read_text(encoding="utf-8"))
+        if training_state_path and training_state_path.is_file()
+        else {}
+    )
     args = TrainingArguments(
         output_dir=str(ROOT / "results" / "bert_checkpoints"), learning_rate=float(BERT["learning_rate"]),
         per_device_train_batch_size=train_batch_size, per_device_eval_batch_size=eval_batch_size, num_train_epochs=epochs,
-        weight_decay=0.01, save_strategy="epoch",
-        load_best_model_at_end=True, metric_for_best_model="eval_loss", save_total_limit=1,
+        weight_decay=0.01,
+        save_strategy="no" if checkpoint else "epoch",
+        load_best_model_at_end=not checkpoint,
+        metric_for_best_model="eval_loss", save_total_limit=1,
         logging_strategy="epoch", report_to="none", seed=SEED,
-        **{eval_strategy_parameter: "epoch"},
+        **{eval_strategy_parameter: "no" if checkpoint else "epoch"},
     )
     def compute_metrics(eval_prediction):
         predicted_ids = np.asarray(eval_prediction.predictions).argmax(axis=-1)
@@ -90,8 +109,11 @@ def main(fast=False):
         compute_metrics=compute_metrics,
     )
     started = time.perf_counter()
-    trainer.train()
-    duration = time.perf_counter() - started
+    if checkpoint:
+        trainer.state.log_history = saved_state.get("log_history", [])
+    else:
+        trainer.train()
+    duration = time.perf_counter() - started if not checkpoint else None
     test_dataset = NewsDataset(test, tokenizer, max_length)
     prediction = trainer.predict(test_dataset)
     logits = prediction.predictions
@@ -140,6 +162,8 @@ def main(fast=False):
             "validation_samples": len(validation),
             "test_samples": len(test),
             "seed": SEED,
+            "checkpoint": str(checkpoint) if checkpoint else None,
+            "checkpoint_step": saved_state.get("global_step") if checkpoint else None,
         },
     }
     METRICS_DIR.mkdir(parents=True, exist_ok=True)
@@ -157,6 +181,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--fast",
         action="store_true",
-        help="Fine-tune on stratified subsets for one epoch, then evaluate on the full test split.",
+        help="Fine-tune for one epoch on stratified subsets and evaluate on a stratified test sample.",
     )
-    main(fast=parser.parse_args().fast)
+    parser.add_argument(
+        "--evaluate-checkpoint",
+        help="Evaluate an existing fine-tuned checkpoint without retraining it.",
+    )
+    arguments = parser.parse_args()
+    main(fast=arguments.fast, evaluate_checkpoint=arguments.evaluate_checkpoint)
