@@ -1,0 +1,28 @@
+api:
+  title: TruthLens AI
+  allowed_origins:
+    - http://localhost:5173
+    - http://127.0.0.1:5173
+prediction:
+  minimum_article_words: 50
+  uncertainty_margin: 0.2
+training:
+  seed: 42
+  split:
+    train: 0.70
+    validation: 0.15
+    test: 0.15
+  max_vocabulary: 30000
+  sequence_length: 500
+  embedding_dimension: 128
+  dense_units: 128
+  recurrent_units: 64
+  dropout: 0.3
+  batch_size: 64
+  epochs: 8
+  bert:
+    base_model: distilbert/distilbert-base-uncased
+    learning_rate: 0.00002
+    epochs: 3
+    max_sequence_length: 256
+    batch_size: 8
